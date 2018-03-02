@@ -1,0 +1,299 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
+using System.Text;
+using System.Threading.Tasks;
+using Containers;
+using InMemoryStructure;
+
+namespace Migration
+{
+    public class Migrate
+    {
+        private static Object thisLock = new object();
+        private Storage source = null;
+        private Storage destination = null;
+        private ListCloudItems SourceItems = null;
+        private List<Containers.File> downloadList = null;
+        private Containers.Directory rootDirectory = null;
+        private Queue<Containers.Directory> downloadQueue = null;
+        private TransactionLogFile transactionLog = null;
+
+        public Migrate(Storage source, Storage destination)
+        {
+            this.source = source;
+            this.destination = destination;
+            transactionLog = new TransactionLogFile();
+            downloadQueue = new Queue<Containers.Directory>();
+            downloadList = new List<Containers.File>();
+        }
+
+        public void StartMigration()
+        {
+            try
+            {
+                if (!IsExistTransactionLogFile())
+                {
+                    GetRootFromSource();
+                    CreateTransactionLogFile();
+                    Task task = Task.Run(() => CopyRootToDestination());
+                    task.Wait();
+                    if (IsCopySuccess())
+                    {
+                        DeleteLogFile();
+                    }
+                }
+                else
+                {
+                    while (IsExistTransactionLogFile())
+                    {
+                        Task task = Task.Run(() => CopyRootToDestination(resume: true));
+                        task.Wait();
+                        if (IsCopySuccess())
+                        {
+                            DeleteLogFile();
+                        }
+                    }
+                }
+                //else
+                //{
+                //    CleanTransactionFile();
+                //}
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e.StackTrace);
+                throw new Exception(e.Message);
+            }
+        }
+
+        private void GetRootFromSource()
+        {
+            ListResource files = new ListResource(source);
+            Task<Containers.Directory> task = Task.Run(() => files.GetFiles());
+            this.rootDirectory = task.Result;
+        }
+
+        // The transaction log file represents a list of all downloadable objects. It is not hierachical
+        private void CreateTransactionLogFile()
+        {
+            downloadQueue.Enqueue(rootDirectory);
+            GetListItemsToDownload();
+            Serialize();
+        }
+
+        private void Serialize()
+        {
+            DataContractJsonSerializer serialize = new DataContractJsonSerializer(typeof(List<Containers.File>));
+            lock (thisLock)
+            {
+                using (FileStream stream = new FileStream(transactionLog.path, FileMode.Create))
+                {
+                    serialize.WriteObject(stream, downloadList);
+                    stream.Flush();
+                }
+            }
+        }
+
+        private void GetListItemsToDownload()
+        {
+            if (downloadQueue.Count == 0)
+                return;
+            while (downloadQueue.Count > 0)
+            {
+                var currentDir = downloadQueue.Dequeue();
+                if (currentDir.Files != null)
+                {
+                    foreach (var item in currentDir.Files)
+                    {
+                        if(item.Name != "file1.docx")
+                        {
+                            item.migrateStatus = "ToDownload";
+                            downloadList.Add(item);
+                        }
+                    }
+                }
+                if (currentDir.SubDirectories != null)
+                {
+                    foreach (var item in currentDir.SubDirectories)
+                    {
+                        item.migrateStatus = "ToDownload";
+                        downloadList.Add((Containers.Directory)item);
+                        downloadQueue.Enqueue(item);
+                    }
+                }
+            }
+            GetListItemsToDownload();
+        }
+
+        private void CopyRootToDestination(bool resume = false)
+        {
+            try
+            {
+                if (resume)
+                {
+                    DeserializeTransactioFile();
+                }
+                List<Task> tasks = new List<Task>();
+                foreach (var item in downloadList)
+                {
+                    //tasks.Add(Task.Run(() =>
+                    //{
+                        if (item != null)
+                        {
+                            if (item.GetType() == typeof(Containers.Directory) && item.migrateStatus == "ToDownload")
+                            {
+                            //if (CopyDirectory((Containers.Directory)item))
+                            Task<bool> newTask = CopyDirectory((Containers.Directory)item);
+
+                            tasks.Add(newTask);
+                                
+                            }                              
+                           else if (item.GetType() == typeof(Containers.File) && item.migrateStatus == "ToDownload")
+                            {
+                            Task<bool> newtask = CopyFile(item);
+                                
+                            }
+                            UpdateTransactionFile(item);
+                        }
+                    //}));
+                }
+
+                Task.WaitAll(tasks.ToArray());
+                //Task.WaitAll(tasks.ToArray());             
+            }
+            catch (Exception e)
+            {
+                throw e;
+            }
+        }
+
+        private void UpdateTransactionFile(Containers.File item)
+        {
+            DataContractJsonSerializer serialize = new DataContractJsonSerializer(typeof(List<Containers.File>));
+            lock (thisLock)
+            {
+                using (FileStream stream = new FileStream(transactionLog.path, FileMode.Open))
+                {
+                    serialize.WriteObject(stream, downloadList);
+                    stream.Flush();
+                }
+            }
+        }
+
+
+        private void DeleteLogFile()
+        {
+            if (IsCopySuccess())
+            {
+                System.IO.File.Delete(transactionLog.path);
+            }
+            else
+            {
+                CleanTransactionFile();
+            }
+        }    
+
+        private bool IsExistTransactionLogFile()
+        {
+            if (System.IO.File.Exists(transactionLog.path))
+                return true;
+            else
+                return false;
+        }
+
+        private void CleanTransactionFile()
+        {
+            foreach (var item in SourceItems.list)
+            {
+                if (item.migrateStatus == "Downloaded")
+                    try
+                    {
+                        SourceItems.list.Remove(item);
+                    }
+                    catch (Exception e)
+                    {
+                        throw e;
+                    }
+            }
+            DataContractJsonSerializer serialize = new DataContractJsonSerializer(typeof(ListCloudItems));
+            lock (thisLock)
+            {
+                using (FileStream stream = new FileStream(transactionLog.path, FileMode.Open))
+                {
+                    serialize.WriteObject(stream, SourceItems);
+                    stream.Flush();
+                }
+            }
+        }
+
+        private bool IsCopySuccess()
+        {
+            bool success = true;
+            foreach(var item in downloadList)
+            {
+                if (item != null && !(item.migrateStatus == "Downloaded"))
+                {
+                    success = false;
+                    break;
+                }
+            }
+            return success;
+        }
+
+        private async Task<bool> CopyDirectory(Containers.File item)
+        {
+            try
+            {
+                if (!System.IO.Directory.Exists(destination.rootPath + item.path + item.Name))
+                    System.IO.Directory.CreateDirectory(destination.rootPath + item.path + item.Name);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        private async Task<bool> CopyFile(Containers.File item)
+        {
+            try
+            {
+                Task<MemoryStream> task = Task.Run(() => source.Download(item));
+                MemoryStream stream = task.Result;
+                destination.Upload(item, stream);
+            }
+            catch (Exception e)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        // Deserialize transaction file and assign the returned object to global variable CloudItems
+        private bool DeserializeTransactioFile()
+        {
+            try
+            {
+                DataContractJsonSerializer ser = new DataContractJsonSerializer(typeof(ListCloudItems));
+                lock (thisLock)
+                {
+                    using (FileStream stream = new FileStream(transactionLog.path, FileMode.Open))
+                    {
+                        stream.Position = 0;
+                        SourceItems = (ListCloudItems)ser.ReadObject(stream);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                return false;
+            }
+            return true;
+        }    
+       
+    }
+}

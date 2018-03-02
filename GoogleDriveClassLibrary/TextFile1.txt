@@ -1,0 +1,163 @@
+﻿using Google.Apis.Drive.v3;
+using Google.Apis.Drive.v3.Data;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace GoogleDriveClassLibrary
+{
+    public class GoogleDrive
+    {
+        private List<Containers.Folder> _listOfFolders = null;
+
+        public async Task<List<Containers.Folder>> GetFolders()
+        {
+            await ExtractFoldersFromDrive("root", "C:\\testDrive");
+            return _listOfFolders;
+        }
+
+        public async Task<List<Containers.File>> GetFiles()
+        {
+            List<Containers.File> listOfFiles = await ExtractFilesFromDrive("root", "C:\\testDrive");
+            return listOfFiles;
+        }
+
+        private async Task<List<Containers.Folder>> ExtractFoldersFromDrive(String folderID, String path)
+        {
+            using (DriveService service = DriveClient.GetInfo())
+            {
+                try
+                {
+                    // Make a request using these request parameters
+                    FilesResource.ListRequest listRequest = service.Files.List();
+                    listRequest.PageSize = 1000;
+                    listRequest.Q = "'" + folderID + "' in parents and trashed = false";
+                    listRequest.OrderBy = "name";
+                    listRequest.Fields = "nextPageToken, files(id, name, mimeType, permissions)";
+                    Google.Apis.Drive.v3.Data.FileList FileList = listRequest.Execute();
+                    if (FileList == null)
+                    {
+                        return null;
+                    }
+                    else
+                    {
+                        while (FileList.Files != null)
+                        {
+                            List<Containers.Folder> listOfFolders = new List<Containers.Folder>();
+                            foreach (var item in FileList.Files)
+                            {
+                                // if the file is a folder type
+                                if (item.MimeType.ToString() == "application/vnd.google-apps.folder")
+                                {
+                                    Containers.Folder folder = new Containers.Folder();
+                                    folder.Name = item.Name;
+                                    CreateFile(folder.Name, path);
+                                    folder.Folders = await ExtractFoldersFromDrive(item.Id, path+"\\"+item.Name);
+                                    folder.Files = await ExtractFilesFromDrive(item.Id, path + "\\" + item.Name);
+                                    folder.Users = GetUsers(item);
+                                    listOfFolders.Add(folder);
+                                }
+                            }
+                            _listOfFolders = listOfFolders;
+                            if (FileList.NextPageToken == null)
+                                break;
+                            listRequest.PageToken = FileList.NextPageToken;
+                            FileList = listRequest.Execute();
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e.Message + " " + e.StackTrace);
+                }
+                return _listOfFolders;
+            }
+        }
+
+        private void CreateFile(String fileName, String path)
+        {
+            Directory.CreateDirectory(path + "\\" + fileName);
+        }
+
+        public async Task<List<Containers.File>> ExtractFilesFromDrive(String folderID, String path)
+        {
+            using (DriveService service = DriveClient.GetInfo())
+            {
+                List<Containers.File> listOfFiles = null;
+                try
+                {
+                    // Make a request using these request parameters
+                     FilesResource.ListRequest listRequest = service.Files.List();
+                    listRequest.PageSize = 1000;
+                    listRequest.Q = "'" + folderID + "' in parents and trashed = false";
+                    listRequest.OrderBy = "name";
+                    listRequest.Fields = "nextPageToken, files(id, name, mimeType, permissions)";
+                    Google.Apis.Drive.v3.Data.FileList files = listRequest.Execute();
+                    while (files != null)
+                    {
+                        listOfFiles = new List<Containers.File>();
+                        foreach (var item in files.Files)
+                        {
+                            if (item.MimeType.ToString() != "application/vnd.google-apps.folder")
+                            {
+                                Directory.CreateDirectory(path + "\\" + item.Name+".file");
+                                Containers.File file = new Containers.File();
+                                file.Name = item.Name;
+                                file.Users = GetUsers(item);
+                                listOfFiles.Add(file);
+                            }
+                        }
+                        if (files.NextPageToken == null)
+                            break;
+                        listRequest.PageToken = files.NextPageToken;
+                        files = listRequest.Execute();
+                    }
+                }
+                catch (Exception e)
+                {
+                    throw new Exception(e.Message + " " + e.StackTrace);
+                }
+
+                return listOfFiles;
+            }
+        }
+
+        public List<Containers.User> GetUsers(Google.Apis.Drive.v3.Data.File file)
+        {
+            List<Containers.User> Users = null;
+            // Add users and permissions
+            IList<Google.Apis.Drive.v3.Data.Permission> permissions = file.Permissions;
+            if (permissions != null && permissions.Count > 0)
+            {
+                Users = new List<Containers.User>();
+                foreach (Google.Apis.Drive.v3.Data.Permission permission in permissions)
+                {
+                    Containers.User user = new Containers.User();
+                    user.DisplayName = permission.DisplayName;
+                    Containers.Permission userPermission = new Containers.Permission();
+                    userPermission.PermissionType = permission.Role.ToString();
+                    user.Permissions = new List<Containers.Permission>();
+                    user.Permissions.Add(userPermission);
+                    Users.Add(user);
+                }
+            }
+            return Users;
+        }
+
+        private FilesResource.ListRequest CreateListRequest(String folderID)
+        {
+            using (DriveService service = DriveClient.GetInfo())
+            {
+                FilesResource.ListRequest listRequest = service.Files.List();
+                listRequest.PageSize = 1000;
+                listRequest.Q = "'" + folderID + "' in parents and trashed = false";
+                listRequest.OrderBy = "name";
+                listRequest.Fields = "FileList(name, id, mimeType, permissions)";
+                return listRequest;
+            }               
+        }
+    }
+}
